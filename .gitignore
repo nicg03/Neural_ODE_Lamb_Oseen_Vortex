@@ -1,0 +1,22 @@
+# File e cartelle Python comuni da ignorare
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+
+# Ambiente virtuale
+venv/
+.env/
+ENV/
+
+# File di sistema
+.DS_Store
+Thumbs.db
+
+# File di output comuni
+*.log
+*.out
+
+# File di dati temporanei
+*.npz
