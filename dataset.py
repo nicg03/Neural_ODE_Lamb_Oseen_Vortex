@@ -1,15 +1,3 @@
-
-"""
-dataset.py — ground-truth trajectories for multi‑vortex Lamb–Oseen flow
-
-Generates training/eval data as particle trajectories r(t) advected by the
-*analytic* Lamb–Oseen multi‑vortex velocity field. Use this to train a true
-Neural ODE that learns the vector field f_θ(x, y, t) ≈ v(x, y, t).
-
-Requirements: numpy, torch
-(torch is only used to return tensors compatible with DataLoader)
-"""
-
 from __future__ import annotations
 import math
 from dataclasses import dataclass
@@ -131,7 +119,6 @@ class TrajectoryDataset(Dataset):
         return r0, self.t, r_traj
 
 if __name__ == "__main__":
-    # quick smoke test & save
     traj, t = simulate_trajectories(n_traj=8, steps=21, seed=42)
     np.savez("/mnt/data/lamb_oseen_trajs.npz", traj=traj, t=t)
     print("Saved example to /mnt/data/lamb_oseen_trajs.npz", traj.shape, t.shape)
