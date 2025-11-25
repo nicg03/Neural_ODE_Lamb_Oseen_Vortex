@@ -13,7 +13,6 @@ except Exception:
 try:
     from config import TRAINING_CONFIG, MODEL_CONFIG, PATHS, DATASET_CONFIG, VORTEX_CONFIG
 except Exception as e:
-    print("[WARN] Impossibile importare config.py. Userò fallback di default:", e)
     TRAINING_CONFIG = {"learning_rate":1e-3}
     MODEL_CONFIG = {}
     PATHS = {"figures":"figs", "model":"data/ff_surrogate.pt", "dataset":"data/dataset.pt"}
@@ -28,7 +27,6 @@ try:
     from dataset import TrajectoryDataset
 except Exception as e:
     TrajectoryDataset = None
-    print("[WARN] Non trovo dataset.TrajectoryDataset. Le valutazioni su traiettorie useranno un fallback sintetico.", e)
 
 # ----------------------------
 #  Lamb–Oseen utilities
@@ -58,9 +56,6 @@ def deterministic_vortices_from_config(vcfg: Dict) -> List[Tuple[float,float,flo
         out.append((float(d["gamma"]), float(d["x"]), float(d["y"])))
     return out
 
-# ----------------------------
-#  Modelli
-# ----------------------------
 class FFModel(nn.Module):
     """Surrogate (x,y,t)->(vx,vy) con MLP 3->2"""
     def __init__(self, hidden: int = 128, depth: int = 3):
@@ -75,7 +70,6 @@ class FFModel(nn.Module):
         return self.net(xyt)
 
 class ODEFunc(nn.Module):
-    """f(r,t) con input [x,y,t] -> [vx,vy]"""
     def __init__(self, hidden: int = 128):
         super().__init__()
         self.net = nn.Sequential(
@@ -94,9 +88,6 @@ class ODEFunc(nn.Module):
         inp = torch.cat([state, t_feat], dim=-1)  # [B,3]
         return self.net(inp)
 
-# ----------------------------
-#  Integrazione traiettorie
-# ----------------------------
 def rk4_step(f, t, y, h):
     k1 = f(t, y)
     k2 = f(t + 0.5*h, y + 0.5*h*k1)
@@ -123,7 +114,6 @@ def rollout_with_ff(ff: FFModel, r0: torch.Tensor, t: torch.Tensor) -> torch.Ten
 
 
 def finite_differences_div_vort(ux: np.ndarray, uy: np.ndarray, grid: np.ndarray) -> Tuple[np.ndarray,np.ndarray]:
-    """Restituisce (div, vorticity). grid è 1D (x o y), spaziatura uniforme assumpta."""
     dx = float(grid[1]-grid[0])
     dy = dx
     dux_dx = np.gradient(ux, dx, axis=1)  # d(ux)/dx
@@ -133,7 +123,6 @@ def finite_differences_div_vort(ux: np.ndarray, uy: np.ndarray, grid: np.ndarray
     return div, dvort
 
 def circulation_on_circle(ux: np.ndarray, uy: np.ndarray, grid: np.ndarray, cx: float, cy: float, radius: float, npts: int = 512) -> float:
-    """Circolazione lineare int v·ds lungo una circonferenza centrata in (cx,cy). Interpola bilinearmente."""
     Xg, Yg = np.meshgrid(grid, grid, indexing='xy')
     # Parametrizzazione del cerchio
     theta = np.linspace(0, 2*np.pi, npts, endpoint=False)
@@ -167,7 +156,7 @@ def plot_heatmap_err(err: np.ndarray, title: str, out_path: str):
     im = plt.imshow(err, origin="lower", extent=[-1,1,-1,1])
     plt.xlabel('x'); plt.ylabel('y'); # plt.title(title)
     plt.colorbar(im, fraction=0.046, pad=0.04)
-    plt.tight_layout(); plt.savefig(out_path, dpi=200); plt.close()
+    plt.tight_layout(); plt.show(); plt.savefig(out_path, dpi=200); plt.close()
 
 def plot_overlay_trajs(trajs: List[np.ndarray], labels: List[str], title: str, out_path: str):
     plt.figure(figsize=(6,5))
@@ -178,7 +167,7 @@ def plot_overlay_trajs(trajs: List[np.ndarray], labels: List[str], title: str, o
             plt.plot(arr[i,:,0], arr[i,:,1], label=lab if i==0 else None)
     plt.xlabel('x'); plt.ylabel('y'); # plt.title(title)
     plt.legend()
-    plt.tight_layout(); plt.savefig(out_path, dpi=200); plt.close()
+    plt.tight_layout(); plt.show(); plt.savefig(out_path, dpi=200); plt.close()
 
 def plot_box(values: List[np.ndarray], labels: List[str], title: str, out_path: str):
     plt.figure(figsize=(6,4.5))
@@ -191,7 +180,7 @@ def plot_curve(x: List[float], y: List[float], xlabel: str, ylabel: str, title: 
     plt.plot(x, y, marker='o')
     plt.xlabel(xlabel); plt.ylabel(ylabel); # plt.title(title)
     plt.grid(True)
-    plt.tight_layout(); plt.savefig(out_path, dpi=200); plt.close()
+    plt.tight_layout(); plt.show(); plt.savefig(out_path, dpi=200); plt.close()
 
 
 def main():
@@ -210,17 +199,12 @@ def main():
 
     ensure_dir(args.out_dir)
 
-    # Costruisci griglia
     grid = np.linspace(-args.domain, args.domain, args.grid_res, dtype=np.float64)
     X, Y = np.meshgrid(grid, grid, indexing='xy')
-
-    # Vortici dal config
     vortices = deterministic_vortices_from_config(VORTEX_CONFIG)
 
-    # --- Campo analitico ground-truth allo snapshot t*
     ux_gt, uy_gt = classic_multi_vortex(X, Y, vortices, t=args.time_snap, nu=args.viscosity)
 
-    # --- Carica FF surrogate ---
     ff = FFModel(hidden=128, depth=3).to(args.device)
     if os.path.exists(args.ff_ckpt):
         ckpt = torch.load(args.ff_ckpt, map_location=args.device)
@@ -231,7 +215,6 @@ def main():
     else:
         print("[WARN] FF checkpoint non trovato:", args.ff_ckpt)
 
-    # --- Carica Neural ODE ---
     ode_func = ODEFunc(hidden=128).to(args.device)
     if args.ode_ckpt and os.path.exists(args.ode_ckpt):
         sd = torch.load(args.ode_ckpt, map_location=args.device)
@@ -248,9 +231,6 @@ def main():
     else:
         print("[WARN] ODE checkpoint non trovato:", args.ode_ckpt)
 
-    # ----------------------------
-    # F1: Heatmap errori sul campo al tempo t*
-    # ----------------------------
     with torch.no_grad():
         pts = np.stack([X.ravel(), Y.ravel(), np.full(X.size, args.time_snap, dtype=np.float32)], axis=1)
         pts_t = torch.from_numpy(pts.astype(np.float32)).to(args.device)
@@ -258,7 +238,6 @@ def main():
         ux_ff = v_ff[:,0].reshape(X.shape)
         uy_ff = v_ff[:,1].reshape(Y.shape)
 
-        # ODE: valuta f(r,t) direttamente con ODEFunc (senza integrare)
         if ode_func is not None:
             r = torch.from_numpy(np.stack([X.ravel(), Y.ravel()], axis=1).astype(np.float32)).to(args.device)
             t_tensor = torch.tensor(args.time_snap, dtype=torch.float32, device=args.device)
@@ -275,9 +254,6 @@ def main():
     plot_heatmap_err(e_ode, "Neural ODE — errore sul campo (||Δv||)", os.path.join(args.out_dir, "F1_ode_field_error.pdf"))
     print("[F1] Salvate heatmap errori campo.")
 
-    # ----------------------------
-    # F2: Traiettorie + boxplot EPE
-    # ----------------------------
 
     if TrajectoryDataset is not None:
         ds = TrajectoryDataset(n_traj=max(args.traj_eval, 512), steps=args.steps, seed=123)
@@ -298,20 +274,16 @@ def main():
             else:
                 traj_ode = traj_ff.copy()  # fallback
 
-        # EPE end-point
         epe_ff = np.linalg.norm(traj_ff[:,-1,:] - traj_gt[:,-1,:], axis=1)
         epe_ode = np.linalg.norm(traj_ode[:,-1,:] - traj_gt[:,-1,:], axis=1)
 
-        # Plot overlay (primi 10)
         plot_overlay_trajs([traj_gt, traj_ff, traj_ode], ["GT", "FF", "ODE"], "Traiettorie (10 esempi)", os.path.join(args.out_dir, "F2_trajs_overlay.pdf"))
         plot_box([epe_ff, epe_ode], ["FF","ODE"], "End-Point Error (GT vs pred.)", os.path.join(args.out_dir, "F2_epe_box.pdf"))
         print(f"[F2] EPE FF (mean±std): {epe_ff.mean():.4e} ± {epe_ff.std():.4e} | ODE: {epe_ode.mean():.4e} ± {epe_ode.std():.4e}")
     else:
         print("[F2] TrajectoryDataset assente: salto confronto traiettorie.")
 
-    # ----------------------------
-    # F3: Step-invariance (variazione di Δt)
-    # ----------------------------
+
     if TrajectoryDataset is not None and odeint is not None:
         dts = [1e-3, 5e-3, 1e-2]
         epe_dt_ff: List[float] = []
@@ -334,9 +306,6 @@ def main():
     else:
         print("[F3] Skip step-invariance (richiede TrajectoryDataset e torchdiffeq).")
 
-    # ----------------------------
-    # F4: Divergenza e vorticità (snapshot t*)
-    # ----------------------------
     div_ff, vort_ff = finite_differences_div_vort(ux_ff, uy_ff, grid)
     div_ode, vort_ode = finite_differences_div_vort(ux_ode, uy_ode, grid)
     plot_heatmap_err(np.abs(div_ff), "FF — |div v|", os.path.join(args.out_dir, "F4_ff_div.pdf"))
@@ -345,9 +314,7 @@ def main():
     plot_heatmap_err(np.abs(vort_ode), "ODE — |ω|", os.path.join(args.out_dir, "F4_ode_vorticity.pdf"))
     print("[F4] Divergenza/Vorticità salvate.")
 
-    # ----------------------------
-    # F5: Circolazione su loop concentrici
-    # ----------------------------
+
     loops_r = [0.25*args.domain, 0.5*args.domain, 0.8*args.domain]
     gam_gt = []; gam_ff = []; gam_ode = []
     for rr in loops_r:
@@ -360,7 +327,6 @@ def main():
     err_ff = pct_err(gam_ff, gam_gt)
     err_ode = pct_err(gam_ode, gam_gt)
 
-    # Plot semplice errori vs r
     plt.figure(figsize=(6,4.5))
     plt.plot(loops_r, err_ff, marker='o', label='FF')
     plt.plot(loops_r, err_ode, marker='s', label='ODE')
