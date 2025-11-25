@@ -2,7 +2,6 @@ import torch
 import numpy as np
 from config import TRAINING_CONFIG, MODEL_CONFIG, PATHS, DATASET_CONFIG, VORTEX_CONFIG
 
-# Funzione esatta del Lamb-Oseen per un singolo vortice
 def lamb_oseen_velocity(x, y, gamma, t, nu, x0=0, y0=0):
     # Traslazione delle coordinate
     x = x - x0
@@ -18,7 +17,7 @@ class FeedForward(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.net = torch.nn.Sequential(
-            torch.nn.Linear(3, 128),  # Aumentato il numero di neuroni
+            torch.nn.Linear(3, 128),  
             torch.nn.Tanh(),
             torch.nn.Linear(128, 128),
             torch.nn.Tanh(),
@@ -53,7 +52,6 @@ def train_model(model, data_in, data_out, config, model_path, metrics_path):
         factor=config['scheduler_factor']
     )
 
-    # Liste per memorizzare le metriche
     train_losses = []
     learning_rates = []
 
@@ -65,19 +63,17 @@ def train_model(model, data_in, data_out, config, model_path, metrics_path):
         optimizer.step()
         scheduler.step(loss)
         
-        # Salva le metriche
+        # Save metrics
         train_losses.append(loss.item())
         learning_rates.append(optimizer.param_groups[0]['lr'])
         
         if epoch % config['print_every'] == 0:
             print(f"Epoch {epoch}: Loss = {loss.item():.6f}, LR = {optimizer.param_groups[0]['lr']:.6f}")
 
-    # Salva le metriche
     np.savez(metrics_path, 
              train_losses=np.array(train_losses),
              learning_rates=np.array(learning_rates))
 
-    # Salva il modello addestrato
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -89,12 +85,11 @@ def train_model(model, data_in, data_out, config, model_path, metrics_path):
     return train_losses, learning_rates
 
 if __name__ == "__main__":
-    # Carica il dataset salvato
+   
     data = torch.load(PATHS['dataset'])
     data_in = data['data_in']
     data_out = data['data_out']
 
-    # Dataset sintetico con tre vortici
     grid = np.linspace(-DATASET_CONFIG['domain_size'], 
                       DATASET_CONFIG['domain_size'], 
                       DATASET_CONFIG['grid_resolution'])
@@ -122,11 +117,9 @@ if __name__ == "__main__":
                                     VORTEX_CONFIG['vortex3']['x'],
                                     VORTEX_CONFIG['vortex3']['y'])
 
-    # Somma dei campi di velocità
     u_x = u_x1 + u_x2 + u_x3
     u_y = u_y1 + u_y2 + u_y3
 
-    # Inizializza e addestra il modello
     model = FeedForward()
     train_model(
         model=model,
