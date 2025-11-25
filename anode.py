@@ -15,12 +15,6 @@ from dataset import TrajectoryDataset
 
 
 class ODEFuncAug(nn.Module):
-    """
-    f_theta(t, [x,y,a]) -> d/dt [x,y,a]
-    - net_xy:  produce (vx, vy)
-    - net_a:   opzionale, produce da/dt se aug_dynamics='learned', altrimenti 0
-    Input rete: [x, y, a..., t]
-    """
     def __init__(self, hidden: int, aug_dim: int, aug_dynamics: Literal["static","learned"] = "static"):
         super().__init__()
         in_dim = 2 + aug_dim + 1  # x,y + a + t
@@ -64,11 +58,6 @@ class ODEFuncAug(nn.Module):
 
 
 class AugmentedNeuralODE(nn.Module):
-    """
-    Wrapper:
-      - opzionale encoder per a0: a0 = 0 (zeros) oppure a0 = Enc(r0)
-      - integra stato esteso e proietta su (x,y)
-    """
     def __init__(
         self,
         hidden: int = 128,
@@ -158,9 +147,6 @@ def train_anode(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     out_dir: str = "data"
 ) -> Tuple[AugmentedNeuralODE, Dict[str, np.ndarray]]:
-    """
-    Nota: se aug_init='mlp', si può penalizzare ||a0||^2 per evitare "abusi" dell'augment.
-    """
     ds = TrajectoryDataset(n_traj=8192, steps=steps, seed=0)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
 
@@ -205,7 +191,7 @@ def train_anode(
         if ep % 5 == 0 or ep == 1:
             print(f"[{ep:03d}] train MSE = {avg:.6f} | lr={opt.param_groups[0]['lr']:.2e}")
 
-    # salva metriche
+    # save metrics
     os.makedirs(out_dir, exist_ok=True)
     tag = f"anode_aug{aug_dim}_{aug_init}_{aug_dynamics}"
     metrics_path = os.path.join(out_dir, f"metrics_{tag}.npz")
