@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, math, argparse, time, sys
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Literal
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,6 +13,7 @@ except Exception:
 try:
     from config import TRAINING_CONFIG, MODEL_CONFIG, PATHS, DATASET_CONFIG, VORTEX_CONFIG
 except Exception as e:
+    print("[WARN] Impossibile importare config.py. Userò fallback di default:", e)
     TRAINING_CONFIG = {"learning_rate":1e-3}
     MODEL_CONFIG = {}
     PATHS = {"figures":"figs", "model":"data/ff_surrogate.pt", "dataset":"data/dataset.pt"}
@@ -27,10 +28,9 @@ try:
     from dataset import TrajectoryDataset
 except Exception as e:
     TrajectoryDataset = None
+    print("[WARN] Non trovo dataset.TrajectoryDataset. Le valutazioni su traiettorie useranno un fallback sintetico.", e)
 
-# ----------------------------
-#  Lamb–Oseen utilities
-# ----------------------------
+
 def lamb_oseen_velocity(x, y, gamma, t, nu, x0=0.0, y0=0.0):
     x = x - x0
     y = y - y0
@@ -57,13 +57,12 @@ def deterministic_vortices_from_config(vcfg: Dict) -> List[Tuple[float,float,flo
     return out
 
 class FFModel(nn.Module):
-    """Surrogate (x,y,t)->(vx,vy) con MLP 3->2"""
     def __init__(self, hidden: int = 128, depth: int = 3):
         super().__init__()
         layers: List[nn.Module] = [nn.Linear(3, hidden), nn.Tanh()]
         for _ in range(depth-1):
             layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 2)]
+        layers += [nn.Linear(2*hidden//2, 2)]  # per evitare errori se si cambia hidden
         self.net = nn.Sequential(*layers)
 
     def forward(self, xyt: torch.Tensor) -> torch.Tensor:
@@ -88,6 +87,99 @@ class ODEFunc(nn.Module):
         inp = torch.cat([state, t_feat], dim=-1)  # [B,3]
         return self.net(inp)
 
+class ODEFuncAug(nn.Module):
+
+    def __init__(self, hidden: int, aug_dim: int, aug_dynamics: Literal["static","learned"] = "static"):
+        super().__init__()
+        in_dim = 2 + aug_dim + 1  # x,y + a + t
+        self.aug_dim = aug_dim
+        self.aug_dynamics = aug_dynamics
+
+        self.net_xy = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, 2)
+        )
+
+        if aug_dynamics == "learned":
+            self.net_a = nn.Sequential(
+                nn.Linear(in_dim, hidden), nn.Tanh(),
+                nn.Linear(hidden, hidden), nn.Tanh(),
+                nn.Linear(hidden, aug_dim)
+            )
+        else:
+            self.net_a = None
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain('tanh'))
+                nn.init.zeros_(m.bias)
+
+    def forward(self, t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+  
+        B = state.shape[0]
+        t_feat = t.expand(B, 1)
+        inp = torch.cat([state, t_feat], dim=-1)  # [B, 3+aug_dim]
+
+        v_xy = self.net_xy(inp)                   # [B,2]
+        if self.net_a is None:
+            v_a = torch.zeros(B, self.aug_dim, device=state.device, dtype=state.dtype)
+        else:
+            v_a = self.net_a(inp)                 # [B,aug_dim]
+        return torch.cat([v_xy, v_a], dim=-1)     # [B, 2+aug_dim]
+
+
+class AugmentedNeuralODE(nn.Module):
+    def __init__(
+        self,
+        hidden: int = 128,
+        aug_dim: int = 2,
+        aug_init: Literal["zeros","mlp"] = "zeros",
+        aug_dynamics: Literal["static","learned"] = "static",
+        rtol: float = 1e-5,
+        atol: float = 1e-6,
+        method: str = "dopri5"
+    ):
+        super().__init__()
+        self.func = ODEFuncAug(hidden=hidden, aug_dim=aug_dim, aug_dynamics=aug_dynamics)
+        self.rtol = rtol
+        self.atol = atol
+        self.method = method
+        self.aug_dim = aug_dim
+        self.aug_init = aug_init
+
+        if aug_init == "mlp":
+            self.enc = nn.Sequential(
+                nn.Linear(2, hidden), nn.Tanh(),
+                nn.Linear(hidden, aug_dim)
+            )
+            for m in self.enc:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain('tanh'))
+                    nn.init.zeros_(m.bias)
+        else:
+            self.enc = None
+
+    def _concat_aug(self, r0: torch.Tensor) -> torch.Tensor:
+        B = r0.shape[0]
+        if self.enc is None:
+            a0 = torch.zeros(B, self.aug_dim, device=r0.device, dtype=r0.dtype)
+        else:
+            a0 = self.enc(r0)
+        return torch.cat([r0, a0], dim=-1)  # [B, 2+aug_dim]
+
+    @torch.no_grad()
+    def rollout(self, r0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if odeint is None:
+            raise RuntimeError("torchdiffeq.odeint non disponibile per rollout ANODE.")
+        s0 = self._concat_aug(r0)                                 # [B,2+aug]
+        traj = odeint(self.func, s0, t, rtol=self.rtol, atol=self.atol, method=self.method)  # [T,B,2+aug]
+        traj = traj.transpose(0,1)                                # [B,T,2+aug]
+        return traj[...,:2]                                       # [B,T,2]
+
+    def forward(self, r0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.rollout(r0, t)
+
 def rk4_step(f, t, y, h):
     k1 = f(t, y)
     k2 = f(t + 0.5*h, y + 0.5*h*k1)
@@ -97,7 +189,6 @@ def rk4_step(f, t, y, h):
 
 @torch.no_grad()
 def rollout_with_ff(ff: FFModel, r0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """Integra r' = ff(r,t) usando RK4 esplicito. r0: [B,2], t: [T]."""
     device = r0.device
     B = r0.shape[0]
     traj = torch.zeros(B, t.numel(), 2, device=device, dtype=r0.dtype)
@@ -124,11 +215,9 @@ def finite_differences_div_vort(ux: np.ndarray, uy: np.ndarray, grid: np.ndarray
 
 def circulation_on_circle(ux: np.ndarray, uy: np.ndarray, grid: np.ndarray, cx: float, cy: float, radius: float, npts: int = 512) -> float:
     Xg, Yg = np.meshgrid(grid, grid, indexing='xy')
-    # Parametrizzazione del cerchio
     theta = np.linspace(0, 2*np.pi, npts, endpoint=False)
     xs = cx + radius*np.cos(theta)
     ys = cy + radius*np.sin(theta)
-    # Indici per interpolazione
     def interp(F, x, y):
         ix = np.clip(np.searchsorted(grid, x) - 1, 0, len(grid)-2)
         iy = np.clip(np.searchsorted(grid, y) - 1, 0, len(grid)-2)
@@ -144,6 +233,7 @@ def circulation_on_circle(ux: np.ndarray, uy: np.ndarray, grid: np.ndarray, cx: 
     uys = interp(uy, xs, ys)
     dx = -radius*np.sin(theta)*(2*np.pi/npts)
     dy =  radius*np.cos(theta)*(2*np.pi/npts)
+
     gamma = np.sum(uxs*dx + uys*dy)
     return float(gamma)
 
@@ -156,7 +246,7 @@ def plot_heatmap_err(err: np.ndarray, title: str, out_path: str):
     im = plt.imshow(err, origin="lower", extent=[-1,1,-1,1])
     plt.xlabel('x'); plt.ylabel('y'); # plt.title(title)
     plt.colorbar(im, fraction=0.046, pad=0.04)
-    plt.tight_layout(); plt.show(); plt.savefig(out_path, dpi=200); plt.close()
+    plt.tight_layout(); plt.savefig(out_path, dpi=200); plt.close()
 
 def plot_overlay_trajs(trajs: List[np.ndarray], labels: List[str], title: str, out_path: str):
     plt.figure(figsize=(6,5))
@@ -167,7 +257,7 @@ def plot_overlay_trajs(trajs: List[np.ndarray], labels: List[str], title: str, o
             plt.plot(arr[i,:,0], arr[i,:,1], label=lab if i==0 else None)
     plt.xlabel('x'); plt.ylabel('y'); # plt.title(title)
     plt.legend()
-    plt.tight_layout(); plt.show(); plt.savefig(out_path, dpi=200); plt.close()
+    plt.tight_layout(); plt.savefig(out_path, dpi=200); plt.close()
 
 def plot_box(values: List[np.ndarray], labels: List[str], title: str, out_path: str):
     plt.figure(figsize=(6,4.5))
@@ -180,13 +270,32 @@ def plot_curve(x: List[float], y: List[float], xlabel: str, ylabel: str, title: 
     plt.plot(x, y, marker='o')
     plt.xlabel(xlabel); plt.ylabel(ylabel); # plt.title(title)
     plt.grid(True)
-    plt.tight_layout(); plt.show(); plt.savefig(out_path, dpi=200); plt.close()
+    plt.tight_layout(); plt.savefig(out_path, dpi=200); plt.close()
 
+@torch.no_grad()
+def eval_anode_velocity_on_grid(anode: AugmentedNeuralODE,
+                                X: np.ndarray,
+                                Y: np.ndarray,
+                                t: float,
+
+    pts = np.stack([X.ravel(), Y.ravel()], axis=1).astype(np.float32)  # [N,2]
+    r = torch.from_numpy(pts).to(device)
+    s = anode._concat_aug(r)  # [N,2+aug]
+    t_tensor = torch.tensor(t, dtype=torch.float32, device=device)
+    B = s.shape[0]
+    inp = torch.cat([s, t_tensor.expand(B,1)], dim=-1)  # [N,3+aug]
+    v_xy = anode.func.net_xy(inp).detach().cpu().numpy()  # [N,2]
+    ux = v_xy[:,0].reshape(X.shape)
+    uy = v_xy[:,1].reshape(Y.shape)
+    return ux, uy
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ff_ckpt", type=str, default=PATHS.get("model","data/ff_surrogate.pt"), help="checkpoint FF (dict con 'model_state_dict')")
     ap.add_argument("--ode_ckpt", type=str, required=False, default="data/neural_ode_lamb_oseen.pt", help="state_dict Neural ODE")
+    ap.add_argument("--anode_ckpt", type=str,
+                    default="/Users/niccologatti/Desktop/final_neural_ode_thesis/models/anode_aug2_mlp_learned.pt",
+                    help="checkpoint AugmentedNeuralODE (state_dict)")
     ap.add_argument("--out_dir", type=str, default=PATHS.get("figures","figs"))
     ap.add_argument("--grid_res", type=int, default=DATASET_CONFIG.get("grid_resolution", 128))
     ap.add_argument("--domain", type=float, default=DATASET_CONFIG.get("domain_size", 2.0))
@@ -197,17 +306,19 @@ def main():
     ap.add_argument("--traj_eval", type=int, default=256)
     args = ap.parse_args()
 
+    device = torch.device(args.device)
     ensure_dir(args.out_dir)
 
     grid = np.linspace(-args.domain, args.domain, args.grid_res, dtype=np.float64)
     X, Y = np.meshgrid(grid, grid, indexing='xy')
+
     vortices = deterministic_vortices_from_config(VORTEX_CONFIG)
 
     ux_gt, uy_gt = classic_multi_vortex(X, Y, vortices, t=args.time_snap, nu=args.viscosity)
 
-    ff = FFModel(hidden=128, depth=3).to(args.device)
+    ff = FFModel(hidden=128, depth=3).to(device)
     if os.path.exists(args.ff_ckpt):
-        ckpt = torch.load(args.ff_ckpt, map_location=args.device)
+        ckpt = torch.load(args.ff_ckpt, map_location=device)
         state = ckpt.get('model_state_dict', ckpt)
         ff.load_state_dict(state, strict=False)
         ff.eval()
@@ -215,9 +326,9 @@ def main():
     else:
         print("[WARN] FF checkpoint non trovato:", args.ff_ckpt)
 
-    ode_func = ODEFunc(hidden=128).to(args.device)
+    ode_func = ODEFunc(hidden=128).to(device)
     if args.ode_ckpt and os.path.exists(args.ode_ckpt):
-        sd = torch.load(args.ode_ckpt, map_location=args.device)
+        sd = torch.load(args.ode_ckpt, map_location=device)
         try:
             ode_func.load_state_dict(sd, strict=True)
             print("[OK] Caricato Neural ODE state_dict in ODEFunc")
@@ -228,31 +339,62 @@ def main():
                     new_sd[k[len("func."):]] = v
             ode_func.load_state_dict(new_sd, strict=False)
             print("[OK] Caricato (best-effort) Neural ODE in ODEFunc:", e)
+        ode_func.eval()
     else:
         print("[WARN] ODE checkpoint non trovato:", args.ode_ckpt)
 
+    anode = None
+    if args.anode_ckpt and os.path.exists(args.anode_ckpt):
+        anode = AugmentedNeuralODE(
+            hidden=128,
+            aug_dim=2,
+            aug_init="mlp",
+            aug_dynamics="learned",
+            rtol=1e-5,
+            atol=1e-6,
+            method="dopri5"
+        ).to(device)
+        sd_anode = torch.load(args.anode_ckpt, map_location=device)
+        state_anode = sd_anode.get("model_state_dict", sd_anode)
+        try:
+            anode.load_state_dict(state_anode, strict=True)
+        except Exception as e:
+            print("[WARN] Caricamento ANODE non perfetto, uso strict=False:", e)
+            anode.load_state_dict(state_anode, strict=False)
+        anode.eval()
+        print("[OK] Caricata AugmentedNeuralODE da", args.anode_ckpt)
+    else:
+        print("[WARN] ANODE checkpoint non trovato:", args.anode_ckpt)
+
     with torch.no_grad():
         pts = np.stack([X.ravel(), Y.ravel(), np.full(X.size, args.time_snap, dtype=np.float32)], axis=1)
-        pts_t = torch.from_numpy(pts.astype(np.float32)).to(args.device)
+        pts_t = torch.from_numpy(pts.astype(np.float32)).to(device)
         v_ff = ff(pts_t).detach().cpu().numpy()
         ux_ff = v_ff[:,0].reshape(X.shape)
         uy_ff = v_ff[:,1].reshape(Y.shape)
 
         if ode_func is not None:
-            r = torch.from_numpy(np.stack([X.ravel(), Y.ravel()], axis=1).astype(np.float32)).to(args.device)
-            t_tensor = torch.tensor(args.time_snap, dtype=torch.float32, device=args.device)
+            r = torch.from_numpy(np.stack([X.ravel(), Y.ravel()], axis=1).astype(np.float32)).to(device)
+            t_tensor = torch.tensor(args.time_snap, dtype=torch.float32, device=device)
             v_ode = ode_func(t_tensor, r).detach().cpu().numpy()
             ux_ode = v_ode[:,0].reshape(X.shape)
             uy_ode = v_ode[:,1].reshape(Y.shape)
         else:
             ux_ode = np.zeros_like(ux_ff); uy_ode = np.zeros_like(uy_ff)
 
+        if anode is not None:
+            ux_anode, uy_anode = eval_anode_velocity_on_grid(anode, X, Y, args.time_snap, device)
+        else:
+            ux_anode = np.zeros_like(ux_ff); uy_anode = np.zeros_like(uy_ff)
+
     e_ff = np.sqrt((ux_ff-ux_gt)**2 + (uy_ff-uy_gt)**2)
     e_ode = np.sqrt((ux_ode-ux_gt)**2 + (uy_ode-uy_gt)**2)
+    e_anode = np.sqrt((ux_anode-ux_gt)**2 + (uy_anode-uy_gt)**2)
 
     plot_heatmap_err(e_ff, "FF — errore sul campo (||Δv||)", os.path.join(args.out_dir, "F1_ff_field_error.pdf"))
     plot_heatmap_err(e_ode, "Neural ODE — errore sul campo (||Δv||)", os.path.join(args.out_dir, "F1_ode_field_error.pdf"))
-    print("[F1] Salvate heatmap errori campo.")
+    plot_heatmap_err(e_anode, "Aug. Neural ODE — errore sul campo (||Δv||)", os.path.join(args.out_dir, "F1_anode_field_error.pdf"))
+    print("[F1] Salvate heatmap errori campo (FF/ODE/ANODE).")
 
 
     if TrajectoryDataset is not None:
@@ -260,8 +402,8 @@ def main():
         t_vec = ds.t.numpy()  # [T]
         T = t_vec.shape[0]
         traj_gt = ds.traj.numpy()  # [N,T,2]
-        r0 = ds.traj[:,0,:].to(args.device)  # [N,2]
-        t_torch = ds.t.to(args.device)
+        r0 = ds.traj[:,0,:].to(device)  # [N,2]
+        t_torch = ds.t.to(device)
 
         with torch.no_grad():
             traj_ff = rollout_with_ff(ff, r0, t_torch).cpu().numpy()
@@ -274,68 +416,100 @@ def main():
             else:
                 traj_ode = traj_ff.copy()  # fallback
 
+            if anode is not None and odeint is not None:
+                traj_anode = anode.rollout(r0, t_torch).cpu().numpy()
+            else:
+                traj_anode = traj_ff.copy()
+
+        # EPE end-point
         epe_ff = np.linalg.norm(traj_ff[:,-1,:] - traj_gt[:,-1,:], axis=1)
         epe_ode = np.linalg.norm(traj_ode[:,-1,:] - traj_gt[:,-1,:], axis=1)
+        epe_anode = np.linalg.norm(traj_anode[:,-1,:] - traj_gt[:,-1,:], axis=1)
 
-        plot_overlay_trajs([traj_gt, traj_ff, traj_ode], ["GT", "FF", "ODE"], "Traiettorie (10 esempi)", os.path.join(args.out_dir, "F2_trajs_overlay.pdf"))
-        plot_box([epe_ff, epe_ode], ["FF","ODE"], "End-Point Error (GT vs pred.)", os.path.join(args.out_dir, "F2_epe_box.pdf"))
-        print(f"[F2] EPE FF (mean±std): {epe_ff.mean():.4e} ± {epe_ff.std():.4e} | ODE: {epe_ode.mean():.4e} ± {epe_ode.std():.4e}")
+        plot_overlay_trajs(
+            [traj_gt, traj_ff, traj_ode, traj_anode],
+            ["GT", "FF", "ODE", "ANODE"],
+            os.path.join(args.out_dir, "F2_trajs_overlay.pdf")
+        )
+        plot_box(
+            [epe_ff, epe_ode, epe_anode],
+            ["FF","ODE","ANODE"],
+            "End-Point Error (GT vs pred.)",
+            os.path.join(args.out_dir, "F2_epe_box.pdf")
+        )
+        print(f"[F2] EPE FF (mean±std): {epe_ff.mean():.4e} ± {epe_ff.std():.4e} | "
+              f"ODE: {epe_ode.mean():.4e} ± {epe_ode.std():.4e} | "
+              f"ANODE: {epe_anode.mean():.4e} ± {epe_anode.std():.4e}")
     else:
         print("[F2] TrajectoryDataset assente: salto confronto traiettorie.")
-
 
     if TrajectoryDataset is not None and odeint is not None:
         dts = [1e-3, 5e-3, 1e-2]
         epe_dt_ff: List[float] = []
         epe_dt_ode: List[float] = []
+        epe_dt_anode: List[float] = []
         ds = TrajectoryDataset(n_traj=128, steps=args.steps, seed=7)
         target = ds.traj.numpy()
-        r0 = ds.traj[:,0,:].to(args.device)
+        r0 = ds.traj[:,0,:].to(device)
         for dt in dts:
             T = int(max(2, (ds.t[-1]-ds.t[0]).item()/dt)) + 1
-            t_custom = torch.linspace(ds.t[0].item(), ds.t[-1].item(), T, device=args.device)
+            t_custom = torch.linspace(ds.t[0].item(), ds.t[-1].item(), T, device=device)
             with torch.no_grad():
                 traj_ff = rollout_with_ff(ff, r0, t_custom).cpu().numpy()
                 traj_ode = odeint(ode_func, r0, t_custom).transpose(0,1).cpu().numpy()
+                if anode is not None:
+                    traj_anode = anode.rollout(r0, t_custom).cpu().numpy()
+                else:
+                    traj_anode = traj_ff.copy()
             epe_ff = np.linalg.norm(traj_ff[:,-1,:] - target[:,-1,:], axis=1).mean()
             epe_ode = np.linalg.norm(traj_ode[:,-1,:] - target[:,-1,:], axis=1).mean()
-            epe_dt_ff.append(epe_ff); epe_dt_ode.append(epe_ode)
+            epe_an = np.linalg.norm(traj_anode[:,-1,:] - target[:,-1,:], axis=1).mean()
+            epe_dt_ff.append(epe_ff)
+            epe_dt_ode.append(epe_ode)
+            epe_dt_anode.append(epe_an)
         plot_curve(dts, epe_dt_ff, "Δt", "EPE end-point", "Step-invariance FF", os.path.join(args.out_dir, "F3_step_inv_ff.pdf"))
         plot_curve(dts, epe_dt_ode, "Δt", "EPE end-point", "Step-invariance ODE", os.path.join(args.out_dir, "F3_step_inv_ode.pdf"))
-        print("[F3] Step-invariance valutata.")
+        plot_curve(dts, epe_dt_anode, "Δt", "EPE end-point", "Step-invariance ANODE", os.path.join(args.out_dir, "F3_step_inv_anode.pdf"))
+        print("[F3] Step-invariance valutata (FF/ODE/ANODE).")
     else:
         print("[F3] Skip step-invariance (richiede TrajectoryDataset e torchdiffeq).")
 
+
     div_ff, vort_ff = finite_differences_div_vort(ux_ff, uy_ff, grid)
     div_ode, vort_ode = finite_differences_div_vort(ux_ode, uy_ode, grid)
+    div_anode, vort_anode = finite_differences_div_vort(ux_anode, uy_anode, grid)
+
     plot_heatmap_err(np.abs(div_ff), "FF — |div v|", os.path.join(args.out_dir, "F4_ff_div.pdf"))
     plot_heatmap_err(np.abs(div_ode), "ODE — |div v|", os.path.join(args.out_dir, "F4_ode_div.pdf"))
+    plot_heatmap_err(np.abs(div_anode), "ANODE — |div v|", os.path.join(args.out_dir, "F4_anode_div.pdf"))
     plot_heatmap_err(np.abs(vort_ff), "FF — |ω|", os.path.join(args.out_dir, "F4_ff_vorticity.pdf"))
     plot_heatmap_err(np.abs(vort_ode), "ODE — |ω|", os.path.join(args.out_dir, "F4_ode_vorticity.pdf"))
-    print("[F4] Divergenza/Vorticità salvate.")
+    plot_heatmap_err(np.abs(vort_anode), "ANODE — |ω|", os.path.join(args.out_dir, "F4_anode_vorticity.pdf"))
+    print("[F4] Divergenza/Vorticità salvate (FF/ODE/ANODE).")
 
-
+ 
     loops_r = [0.25*args.domain, 0.5*args.domain, 0.8*args.domain]
-    gam_gt = []; gam_ff = []; gam_ode = []
+    gam_gt = []; gam_ff = []; gam_ode = []; gam_anode = []
     for rr in loops_r:
         gam_gt.append(circulation_on_circle(ux_gt, uy_gt, grid, cx=0.0, cy=0.0, radius=rr))
         gam_ff.append(circulation_on_circle(ux_ff, uy_ff, grid, cx=0.0, cy=0.0, radius=rr))
         gam_ode.append(circulation_on_circle(ux_ode, uy_ode, grid, cx=0.0, cy=0.0, radius=rr))
+        gam_anode.append(circulation_on_circle(ux_anode, uy_anode, grid, cx=0.0, cy=0.0, radius=rr))
+
     def pct_err(pred, ref):
         pred = np.array(pred); ref = np.array(ref)
         return list(100.0*np.abs(pred-ref)/(np.maximum(1e-12, np.abs(ref))))
     err_ff = pct_err(gam_ff, gam_gt)
     err_ode = pct_err(gam_ode, gam_gt)
+    err_anode = pct_err(gam_anode, gam_gt)
 
     plt.figure(figsize=(6,4.5))
     plt.plot(loops_r, err_ff, marker='o', label='FF')
     plt.plot(loops_r, err_ode, marker='s', label='ODE')
+    plt.plot(loops_r, err_anode, marker='^', label='ANODE')
     plt.xlabel('r loop'); plt.ylabel('Errore circolazione [%]');  # plt.title('Consistenza di circolazione')
     plt.grid(True); plt.legend()
     plt.tight_layout(); plt.savefig(os.path.join(args.out_dir, "F5_circulation_error.pdf"), dpi=200); plt.close()
-    print("[F5] Circolazione su loop completata.")
-
-    print(f"[DONE] Figure salvate in: {os.path.abspath(args.out_dir)}")
 
 if __name__ == "__main__":
     main()
