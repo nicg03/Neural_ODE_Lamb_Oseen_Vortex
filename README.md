@@ -110,11 +110,14 @@ to get all physics metrics used to compare FF, NODE and ANODE networks.
 ## Evaluation Metrics
 
 ### Velocity Field Error
-<img src="figs/my_figure.png" width="500">
+<img src="figs/F1_ff_field_error.png" width="250"> <img src="figs/F1_ode_field_error.png" width="250">
 
 ### Divergence field
+<img src="figs/F4_ff_div.png" width="250"> <img src="figs/F4_ode_div.png" width="250">
 ### Vorticity field
+<img src="figs/F4_ff_vorticity.png" width="250"> <img src="figs/F4_ode_vorticity.png" width="250">
 ### Step-Invariance
+<img src="figs/F3_step_inv_ff.png" width="250"> <img src="figs/F3_step_inv_ode.png" width="250">
 
 ---
 ## Results Summary
