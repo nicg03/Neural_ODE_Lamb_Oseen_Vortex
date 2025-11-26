@@ -9,7 +9,7 @@ The goal is to compare classic feedforward models with continuous-time neural fo
 
 We aim to learn the continuous law
 
-$\dot{\mathbf{r}}(t) = \mathbf{v}(\mathbf{r}(t), t)$
+$$\dot{\mathbf{r}}(t) = \mathbf{v}(\mathbf{r}(t), t)$$
 
 where $\mathbf{v}$ is the multi-vortex Lamb–Oseen velocity field.  
 Three models are implemented:
@@ -29,16 +29,16 @@ The evaluation focuses on **physical coherence**, including vorticity, divergenc
 A viscous vortex with tangential velocity:
 
 
-$v_\theta(r,t) = \frac{\Gamma}{2\pi r}\left(1 - e^{-r^2/(4\nu t)}\right) $
+$$v_\theta(r,t) = \frac{\Gamma}{2\pi r}\left(1 - e^{-r^2/(4\nu t)}\right) $$
 
 and vorticity:
 
-$\omega(r,t) = \frac{\Gamma}{4\pi\nu t}\exp\!\left(-\frac{r^2}{4\nu t}\right)$
+$$\omega(r,t) = \frac{\Gamma}{4\pi\nu t}\exp\!\left(-\frac{r^2}{4\nu t}\right)$$
 
 ### Multi-Vortex Superposition
 The flow field is the linear sum of multiple Lamb–Oseen vortices with different circulations and centers:
 
-$\mathbf{v}(x,t) = \sum_i \mathbf{v}_i(x,t)$
+$$\mathbf{v}(x,t) = \sum_i \mathbf{v}_i(x,t)$$
 
 This analytic field is the reference for dataset generation and model evaluation.
 
@@ -48,7 +48,7 @@ This analytic field is the reference for dataset generation and model evaluation
 
 `dataset.py` generates Lagrangian trajectories by integrating the analytic field using RK4.
 
-- Domain: \([-2, 2]^2\)  
+- Domain: $([-2, 2]x[-2, 2])$  
 - Time span: typically 51 steps  
 - Output:  
   - `r0` initial condition  
@@ -177,6 +177,13 @@ Neural ODEs can in fact represent an effective compromise, overcoming the black-
 ```python
 pip install torch torchdiffeq numpy matplotlib
 ```
+
+---
+## Next Steps
+- Integrate PINNs losses
+- Experiment with Neural ODEs as surrogate of 2D Navier-Stokes solvers
+- Extend to 3D domain
+
 
 
 
